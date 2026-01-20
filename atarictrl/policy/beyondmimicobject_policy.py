@@ -1,0 +1,469 @@
+import logging
+
+import numpy as np
+import onnxruntime as ort
+
+from atarictrl.environment.utils.mujoco_viz import MujocoVisualizer
+from atarictrl.policy import Policy, policy_registry
+from atarictrl.policy.policy_cfgs import BeyondMimicObjectPolicyCfg
+from atarictrl.tools.dof import DoFConfig
+from atarictrl.utils.progress import ProgressBar
+from atarictrl.utils.rotation import TransformAlignment
+from atarictrl.utils.util_func import matrix_from_quat, quat_mul, subtract_frame_transforms, my_quat_rotate_np
+
+logger = logging.getLogger(__name__)
+
+
+@policy_registry.register
+class BeyondMimicObjectPolicy(Policy):
+    cfg_policy: BeyondMimicObjectPolicyCfg
+
+    def __init__(self, cfg_policy: BeyondMimicObjectPolicyCfg, device):
+        # init onnx, override dof cfg if needed
+        sess_options = ort.SessionOptions()
+
+        device = "cpu"
+        if device == "cpu":
+            providers = ["CPUExecutionProvider"]
+        elif device == "cuda":
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif device == "tensorrt":
+            # Jetson
+            providers = [
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        else:
+            raise ValueError(f"Unknown device: {device}")
+
+        self.session = ort.InferenceSession(cfg_policy.policy_file, sess_options, providers=providers)
+
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.motion_anchor_body_index = -1
+
+        cfg_policy_new = cfg_policy.model_copy()
+        if cfg_policy_new.use_modelmeta_config:
+            logger.info("[BeyondMimicPolicy] Using modelmeta as config ...")
+            modelmeta = self.session.get_modelmeta()  # all str,
+            modelmeta_dict = modelmeta.custom_metadata_map
+
+            # dict_keys(['joint_names', 'run_path', 'command_names', 'joint_stiffness', 'joint_damping',
+            # 'default_joint_pos', 'action_scale', 'observation_names', 'anchor_body_name', 'body_names'])
+            def parse_floats(s):
+                return [float(item) for item in s.split(",")]
+
+            def parse_strings(s):
+                return [item for item in s.split(",")]
+
+            dof_config = DoFConfig(
+                joint_names=parse_strings(modelmeta_dict["joint_names"]),
+                default_pos=parse_floats(modelmeta_dict["default_joint_pos"]),
+                stiffness=parse_floats(modelmeta_dict["joint_stiffness"]),
+                damping=parse_floats(modelmeta_dict["joint_damping"]),
+            )
+            action_scales = parse_floats(modelmeta_dict["action_scale"])
+
+            anchor_body_name = modelmeta_dict["anchor_body_name"]
+            body_names = parse_strings(modelmeta_dict["body_names"])
+            self.motion_anchor_body_index = body_names.index(anchor_body_name)
+            self.use_motion_offset = modelmeta_dict.get("use_motion_offset", False)
+            # command_names = parse_strings(modelmeta_dict["command_names"])
+            # observation_names = parse_strings(modelmeta_dict["observation_names"])
+
+            cfg_policy_new.action_dof = dof_config
+            cfg_policy_new.obs_dof = dof_config
+
+            cfg_policy_new.action_scales = action_scales
+
+        super().__init__(cfg_policy=cfg_policy_new, device=device)
+        self.action_scales = np.asarray(self.cfg_policy.action_scales)
+        self.without_state_estimator = self.cfg_policy.without_state_estimator
+        self.override_robot_anchor_pos = self.cfg_policy.override_robot_anchor_pos
+        self.use_motion_from_model = self.cfg_policy.use_motion_from_model
+
+        self.max_timestep = self.cfg_policy.max_timestep
+        self.command = None
+        self.reset()
+
+        if self.use_motion_from_model:
+            assert self.motion_anchor_body_index >= 0, "motion_anchor_body_index not set"
+            assert self.command is not None, "command not initialized"
+            command_init = self.command.copy()
+
+            # motion init2anchor alignment
+            anchor_pos_w_init = command_init["body_pos_w"][self.motion_anchor_body_index, :]
+            anchor_quat_w_init = command_init["body_quat_w"][self.motion_anchor_body_index, :][[1, 2, 3, 0]]
+
+            self.command_init_align = TransformAlignment(
+                quat=anchor_quat_w_init, pos=anchor_pos_w_init, yaw_only=True, xy_only=True
+            )
+
+    def _prepare_policy(self):
+        obs_shape = self.session.get_inputs()[0].shape  # e.g. [1, 154]
+        obs = np.zeros(obs_shape[1], dtype=np.float32)
+        self.get_action(obs)
+
+    def reset(self):
+        self.timestep: float = self.cfg_policy.start_timestep
+        if self.use_motion_from_model:
+            self.pbar = ProgressBar(f"Beyondmimic {self.cfg_policy.policy_name}", self.max_timestep)
+        else:
+            self.pbar = None
+        self.play_speed: float = 1.0
+        self.flag_motion_done = False
+        self._prepare_policy()
+
+    def post_step_callback(self, commands: list[str] | None = None):
+        self.timestep += 1 * self.play_speed
+        if self.pbar:
+            self.pbar.set(self.timestep)
+
+        if 0 < self.max_timestep <= self.timestep:
+            self.play_speed = 0.0
+            self.flag_motion_done = True
+
+        for command in commands or []:
+            match command:
+                case "[MOTION_RESET]":
+                    self.reset()
+                case "[MOTION_FADE_IN]":
+                    self.play_speed = 1.0
+                case "[MOTION_FADE_OUT]":
+                    self.play_speed = 0.0
+
+    def _get_command(self, env_data, ctrl_data):
+        if not self.use_motion_from_model:
+            assert "BeyondMimicCtrl" in ctrl_data, "BeyondMimicCtrl not found in ctrl_data"
+            command = ctrl_data.get("BeyondMimicCtrl")
+            self.command = command
+            object_pos_w = command.object_pos_w if hasattr(command, 'object_pos_w') else None
+            object_quat_w = command.object_quat_w if hasattr(command, 'object_quat_w') else None
+            hand_pose = command.hand_pose if hasattr(command, 'hand_pose') else None
+            return (
+                command.command,
+                command.robot_anchor_pos_w,
+                command.robot_anchor_quat_w,
+                command.anchor_pos_w,
+                command.anchor_quat_w,
+                hand_pose,
+                object_pos_w,
+                object_quat_w,
+            )
+        else:
+            assert self.command is not None, "command not initialized"
+            command = np.concatenate([self.command["joint_pos"], self.command["joint_vel"]], axis=-1)
+
+            anchor_pos_w = self.command["body_pos_w"][self.motion_anchor_body_index, :]
+            anchor_quat_w = self.command["body_quat_w"][self.motion_anchor_body_index, :][[1, 2, 3, 0]]
+            
+            # Get object pos/quat from ctrl_data if available (for motion_from_model case)
+            object_pos_w = self.command.get("object_pos_w", None)
+            object_quat_w = self.command.get("object_quat_w", None)[[1, 2, 3, 0]]
+                        
+            if self.command_init_align is not None:
+                anchor_quat_w, anchor_pos_w = self.command_init_align.align_transform(anchor_quat_w, anchor_pos_w)
+                object_quat_w, object_pos_w = self.command_init_align.align_transform(object_quat_w, object_pos_w)
+
+            if self.override_robot_anchor_pos:  # OVERRIDE
+                robot_anchor_pos_w = anchor_pos_w.copy()
+            else:
+                base_pos = env_data.torso_pos
+                robot_anchor_pos_w = base_pos
+
+            robot_anchor_quat_w = env_data.torso_quat
+
+            return command, robot_anchor_pos_w, robot_anchor_quat_w, anchor_pos_w, anchor_quat_w, None, object_pos_w, object_quat_w
+
+    def get_observation(self, env_data, ctrl_data):
+        dof_pos = env_data.dof_pos
+        dof_vel = env_data.dof_vel
+        ang_vel = env_data.base_ang_vel
+        lin_vel = env_data.base_lin_vel
+
+        command, robot_anchor_pos_w, robot_anchor_quat_w, anchor_pos_w, anchor_quat_w, hand_pose, cmd_object_pos_w, cmd_object_quat_w = self._get_command(
+            env_data, ctrl_data
+        )
+        
+        pos, ori = subtract_frame_transforms(
+            robot_anchor_pos_w,
+            robot_anchor_quat_w,
+            anchor_pos_w,
+            anchor_quat_w,
+        )
+        mat = matrix_from_quat(ori)
+
+        obs_command = command
+        obs_motion_anchor_pos_b = pos
+        obs_motion_anchor_ori_b = mat[:, :2].flatten()
+
+        obs_base_lin_vel = lin_vel
+        obs_base_ang_vel = ang_vel
+        obs_joint_pos_rel = dof_pos - self.default_dof_pos
+        obs_joint_vel_rel = dof_vel
+        obs_last_action = self.last_action
+        
+        object_pos_w = env_data["box/base_pos_w"].copy()
+        object_quat_w = env_data["box/base_quat"].copy()
+        
+        # Object observations
+        pos_obj_anchorframe, ori_obj_anchorframe = subtract_frame_transforms(
+            robot_anchor_pos_w, # actual anchor position (not from motion trajectory)
+            robot_anchor_quat_w, # actual anchor orientation (not from motion traj) 
+            object_pos_w,
+            object_quat_w,
+        )
+        ori_obj_anchor = matrix_from_quat(ori_obj_anchorframe)[:, :2].flatten()
+        
+        _, ori_error = subtract_frame_transforms(
+            cmd_object_pos_w,
+            cmd_object_quat_w,
+            object_pos_w,
+            object_quat_w,
+        )
+
+        error_object_pos_w = object_pos_w - cmd_object_pos_w
+        error_object_ori_w = matrix_from_quat(ori_error)[:, :2].flatten()
+
+        
+        obs_prop = np.concatenate(
+            [
+                obs_command,
+                obs_motion_anchor_pos_b if not self.without_state_estimator else [],
+                obs_motion_anchor_ori_b,
+                obs_base_lin_vel if not self.without_state_estimator else [],
+                obs_base_ang_vel,
+                obs_joint_pos_rel,
+                obs_joint_vel_rel,
+                obs_last_action,
+                
+                pos_obj_anchorframe,
+                # ori_obj_anchor,
+                error_object_pos_w,
+                error_object_ori_w
+            ]
+        )
+        
+
+        obs = obs_prop
+        extras = {
+            "pos": pos,
+            "ori": ori,
+            "robot_anchor_pos_w": robot_anchor_pos_w,
+            "robot_anchor_quat_w": robot_anchor_quat_w,
+            "anchor_pos_w": anchor_pos_w,
+            "anchor_quat_w": anchor_quat_w,
+            "command": command,
+            "hand_pose": hand_pose,
+            "object_pos_w": cmd_object_pos_w,
+            "object_quat_w": cmd_object_quat_w,
+            ""
+            # "object_quat_w": object_quat_w,
+            "CALLBACK": ["[MOTION_DONE]"] if self.flag_motion_done else [],
+        }
+        # Also log the command dict if available (for visualization)
+        if self.use_motion_from_model and self.command is not None:
+            body_quat_w, body_pos_w = self.command_init_align.align_transform(self.command["body_quat_w"][:, [1, 2, 3, 0]], self.command["body_pos_w"])
+            extras["command_dict"] = {
+                "body_pos_w": body_pos_w,
+                "body_quat_w": body_quat_w,
+                "object_pos_w": self.command.get("object_pos_w"),
+                "object_quat_w": self.command.get("object_quat_w"),
+            }
+
+        return obs, extras
+
+    def get_action(self, obs: np.ndarray) -> np.ndarray:
+        ort_inputs = {
+            "obs": np.expand_dims(obs, axis=0).astype(np.float32),
+            "time_step": np.expand_dims(np.array([int(self.timestep)]), axis=0).astype(np.float32),
+        }
+
+        ort_outputs = self.session.run(
+            [
+                "actions",
+                "joint_pos",
+                "joint_vel",
+                "body_pos_w",
+                "body_quat_w",
+                "object_pos_w",
+                "object_quat_w",    
+            ],
+            ort_inputs,
+        )
+        actions: np.ndarray = np.asarray(ort_outputs[0]).squeeze()
+
+        actions = (1 - self.action_beta) * self.last_action + self.action_beta * actions
+        self.last_action = actions.copy()
+
+        scaled_actions = actions * self.action_scales
+        # used for debugging
+        r = np.array([0.0, 0.0, 0.0, 1.0])  # [x, y, z, w] format for scipy
+        t = np.array([0.0, 0.0, 0.0])
+        rot = np.tile(r, (14, 1))
+        if self.use_motion_from_model:
+            self.command = {
+                "time_step": self.timestep,
+                "joint_pos": np.asarray(ort_outputs[1]).squeeze(),
+                "joint_vel": np.asarray(ort_outputs[2]).squeeze(),
+                "body_pos_w": my_quat_rotate_np(r, np.asarray(ort_outputs[3]).squeeze()) + t,
+                "body_quat_w": quat_mul(rot[:, [3, 0, 1, 2]], np.asarray(ort_outputs[4]).squeeze()),  # [w, x, y, z] for quat_mul
+                "object_pos_w": my_quat_rotate_np(r, np.asarray(ort_outputs[5]).squeeze()) + t,
+                "object_quat_w": quat_mul(r[[3, 0, 1, 2]], np.asarray(ort_outputs[6]).squeeze()),  # [w, x, y, z] for quat_mul
+            }
+
+        return scaled_actions
+
+    def get_init_dof_pos(self) -> np.ndarray:
+        """
+        Return first frame of the reference motion.
+        """
+        if self.command is not None:
+            joint_pos = self.command["joint_pos"]
+            return joint_pos.copy()
+        else:
+            return self.default_dof_pos.copy()
+
+    def debug_viz(self, visualizer: MujocoVisualizer, env_data, ctrl_data, extras):
+        robot_anchor_pos_w = extras["robot_anchor_pos_w"]
+        robot_anchor_quat_w = extras["robot_anchor_quat_w"]
+        anchor_pos_w = extras["anchor_pos_w"]
+        anchor_quat_w = extras["anchor_quat_w"]
+
+        pos = extras["pos"]
+        ori = extras["ori"]
+
+        visualizer.draw_arrow(anchor_pos_w, anchor_quat_w, [0.2, 0, 0], color=[1, 0, 0, 1], scale=2, id=0)
+        visualizer.draw_arrow(
+            robot_anchor_pos_w,
+            robot_anchor_quat_w,
+            [0.2, 0, 0],
+            color=[0, 1, 0, 1],
+            scale=2,
+            id=1,
+        )
+        visualizer.draw_arrow(robot_anchor_pos_w, robot_anchor_quat_w, pos, color=[0, 1, 1, 1], scale=2, id=2)
+
+        torso_pos = env_data["torso_pos"]
+        torso_quat = env_data["torso_quat"]
+
+        visualizer.draw_arrow(torso_pos, torso_quat, [0.2, 0, 0], color=[1, 1, 0, 1], scale=2, id=3)
+
+        # Draw green spheres at body_pos_w positions from command
+        if self.command is not None and "body_pos_w" in self.command:
+            # body_quat_w, body_pos_w = self.command["body_quat_w"][:, [1, 2, 3, 0]], self.command["body_pos_w"]
+            body_quat_w, body_pos_w = self.command_init_align.align_transform(self.command["body_quat_w"][:, [1, 2, 3, 0]], self.command["body_pos_w"])
+
+            # body_pos_w = self.command["body_pos_w"]
+            # body_quat_w = self.command["body_quat_w"]
+            # Handle both 1D and 2D arrays
+            if body_pos_w.ndim == 1:
+                body_pos_w = body_pos_w.reshape(1, -1)
+            
+            # Use humanoid_id=1 for green spheres
+            visualizer.update_rg_view(body_pos_w, body_quat_w, humanoid_id=1)
+
+        # Draw desired box pose from command
+        if self.command is not None and "object_pos_w" in self.command and "object_quat_w" in self.command:
+            object_pos = self.command["object_pos_w"]
+            object_quat = self.command["object_quat_w"]  # stored as [w, x, y, z]
+            
+            
+            # Handle both 1D and 2D arrays for position and quaternion
+            if object_pos.ndim == 1:
+                obj_pos = object_pos
+            else:
+                obj_pos = object_pos[0, :] if object_pos.shape[0] > 0 else object_pos.flatten()
+            
+            if object_quat.ndim == 1:
+                obj_quat = object_quat
+            else:
+                obj_quat = object_quat[0, :] if object_quat.shape[0] > 0 else object_quat.flatten()
+          
+            # Convert quaternion from [w, x, y, z] to [x, y, z, w] for scipy
+            obj_quat_scipy = obj_quat[[1, 2, 3, 0]]
+            
+            # # Apply alignment transformation if available (same as anchor)
+            if self.command_init_align is not None:
+                obj_quat_scipy, obj_pos = self.command_init_align.align_transform(obj_quat_scipy, obj_pos)
+            
+            # Box size is half-extents (half of object dimensions)
+            # Box dimensions: (0.1, 0.1, 0.115)
+            box_size = np.array([0.155, 0.155, 0.17])
+            
+            visualizer.draw_box(
+                pos=obj_pos,
+                quat=obj_quat_scipy,
+                size=box_size,
+                color=[0.0, 1.0, 0.0, 0.6],  # Green, semi-transparent
+                label="Desired Box Pose",
+                id=1000,
+            )
+            axis_length = 0.5  # Length of each axis arrow
+          
+            visualizer.draw_arrow(
+                origin=obj_pos,
+                root_quat=obj_quat_scipy,
+                vec_local=[axis_length, 0.0, 0.0],
+                color=[1.0, 0.0, 0.0, 1.0],  # Red
+                scale=1.0,
+                id=1001,
+
+            )
+            # Y axis (green)
+            visualizer.draw_arrow(
+                origin=obj_pos,
+                root_quat=obj_quat_scipy,
+                vec_local=[0.0, axis_length, 0.0],
+                color=[0.0, 1.0, 0.0, 1.0],  # Green
+                scale=1.0,
+                id=101,
+            )
+            
+            # Z axis (blue)
+            visualizer.draw_arrow(
+                origin=obj_pos,
+                root_quat=obj_quat_scipy,
+                vec_local=[0.0, 0.0, axis_length],
+                color=[0.0, 0.0, 1.0, 1.0],  # Blue
+                scale=1.0,
+                id=102,
+            )
+
+        # Draw actual object frame (X, Y, Z axes)
+        if "box/base_pos_w" in env_data and "box/base_quat" in env_data:
+            object_pos_w = env_data["box/base_pos_w"].copy()
+            object_quat_w = env_data["box/base_quat"].copy()  # [x, y, z, w] format
+            
+            axis_length = 0.5  # Length of each axis arrow
+            
+            # X axis (red)
+            visualizer.draw_arrow(
+                origin=object_pos_w,
+                root_quat=object_quat_w,
+                vec_local=[axis_length, 0.0, 0.0],
+                color=[1.0, 0.0, 0.0, 1.0],  # Red
+                scale=1.0,
+                id=10,
+            )
+            
+            # Y axis (green)
+            visualizer.draw_arrow(
+                origin=object_pos_w,
+                root_quat=object_quat_w,
+                vec_local=[0.0, axis_length, 0.0],
+                color=[0.0, 1.0, 0.0, 1.0],  # Green
+                scale=1.0,
+                id=11,
+            )
+            
+            # Z axis (blue)
+            visualizer.draw_arrow(
+                origin=object_pos_w,
+                root_quat=object_quat_w,
+                vec_local=[0.0, 0.0, axis_length],
+                color=[0.0, 0.0, 1.0, 1.0],  # Blue
+                scale=1.0,
+                id=12,
+            )

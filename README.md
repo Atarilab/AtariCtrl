@@ -1,8 +1,6 @@
 <div align="center">
 <h1>ATARICtrl 🤖</h1>
 
-*A plug-and-play deploy framework for robots. Just deploy, just do.*
-
 <p>
   <!-- Platforms -->
   <img src="https://img.shields.io/badge/platform-Ubuntu%20%7C%20Linux-green" alt="platform"/>
@@ -18,47 +16,11 @@
 </div>
 
 
-Our framework highlights:
-- **Out-of-the-box**: After setting up ATARICtrl, multiple policies can be deployed on both simulation and real robots in minutes: [Quick Start](#quick-start).
-
-- **Decoupled & Modular Design**: With a Python-first design, ATARICtrl makes fast prototyping easy. Environment, Controller, and Policy are modular and freely composable, while minimal code changes allow seamless adaptation across robots and setups: See how we achieve this: [Add a new module](#add-a-new-module).
-
-- **Multi-policy switching**: Seamlessly switch between different policies during a task. Try this: [Multi-Policy Switching](#multi-policy-switch).
-
-- **Light-Weight**: Our framework is lightweight, after 5 minutes of setup, it runs smoothly onboard. By [UnitreeCpp](https://github.com/Atarilab/unitree_cpp), ATARICtrl runs on Unitree G1 without the need for an Ethernet cable.
-
 
 # 📓Content
  - [📄Introduction](#introduction)
  - [🛠️Easy Setup](#%EF%B8%8Feasy-setup)
  - [📖Quick Start](#quick-start)
- - [🧩 Develop and Contribute](#develop-and-contribute)
-
-
-# 🗺️Roadmap
-
-<table>
-<tr>
-<td width="80%">
-
-- [x] [2025.04] Initialized project
-- [x] [2025.05] Add support for Unitree G1
-- [x] [2025.06] Integrated Unitree C++ SDK
-- [x] [2025.08] Add support for beyondmimic
-- [x] Add policy-switch pipeline with interpolation, check [LocoMimic Example](#loco-mimic-policy-switch-with-interpolation)!
-- [ ] Upcoming policies...
-
- 
-
-</td>
-<td width="20%">
-
-<div align="center">
-<img src="docs\images\job.gif" alt="working" width="100%" >
-</div>
-
-</td>
-</table>
 
 # 📄Introduction
 
@@ -163,7 +125,7 @@ In the following, we use the deployment on G1 as an example.
 
 <!-- 😎For module combinations, we provide ready-to-use config files that can be directly applied.  -->
 1. [Run Sim2Sim](#run-atarictrl-on-simulation)
-2. [Run Sim2Real](#run-atarictrl-on-real-robot-🤖)
+2. [Run Sim2Real](#run-atarictrl-on-real-robot)
 3. [Deploy More Policies✨](#deploy-more-policies)
 
 ## Run ATARICtrl on Simulation
@@ -199,7 +161,7 @@ You can control the simulation environment using the Keyboard:
 - `shift + |` reset the motion progress
 - `~` button: reset robot. -->
 
-## Run ATARICtrl on Real Robot 🤖
+## Run ATARICtrl on Real Robot
 
 ### Alert & Disclaimer ⚠️⚠️⚠️
 > Before deployment, you'd better first purchase accident insurance to cover any potential incidents that may occur during real-world operation. Policies could cause ⚠️**violent motions**⚠️ when losing balance. Always verify that the emergency stop button (e.g., **A** for default config) works properly.
@@ -309,19 +271,8 @@ Keyboard control:
 We also provide config files for other policies, check [config_g1](atarictrl/config/g1) for more details.
 
 
-# 🧩Develop and Contribute
-
-## Add a new module
-
-Refer to the documentation on [Policy](docs/policy.md), [Controller](docs/controller.md), [Env](docs/environment.md), create and deploy your own policy in minutes.
-
-(By the way, deploying GMT takes about 1 hour in our framework.)
-
-Or simply create an issue — we will include updates in future releases!
-
-
 # 🔗 Related Repo
-
+- [RoboJudo](https://github.com/HansZ8/RoboJuDo): Framework
 - [Unitree SDK2 Python](https://github.com/unitreerobotics/unitree_sdk2_python): used for implementing `UnitreeEnv`.
 - [PHC](https://github.com/ZhengyiLuo/PHC): used for implementing the `MotionCtrl` module for OmniH2O.
 - [UnitreeCpp](https://github.com/GDDG08/unitree_cpp): our pybind of `unitree_sdk2` used in `UnitreeCppEnv`.
